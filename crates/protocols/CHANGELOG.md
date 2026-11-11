@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
+  `identity`) before it reads the body, as a `415` in the gateway's JSON error envelope
+  (`error.code` `json_parse_error`, the encoding named in the message); it parsed the compressed
+  bytes as JSON and refused them as a `400` with a syntax error. `undecodable_content_encoding`
+  and `content_encoding_message`, behind the `axum` feature, are the header's reading and the
+  message, shared with the gateway's control-plane JSON extractor, which answers the same.
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
   `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
   grown from 104 to 128 bytes when the schema kept its description and the structural tag
