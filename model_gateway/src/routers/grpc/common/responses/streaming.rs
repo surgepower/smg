@@ -135,6 +135,77 @@ struct OutputTextDelta<'a> {
     delta: &'a str,
 }
 
+/// The `response.created` event: the response object as the stream opens,
+/// the fields in the event's order, the strings borrowed from the emitter.
+#[derive(Serialize)]
+struct ResponseCreated<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    response: CreatedResponse<'a>,
+}
+
+#[derive(Serialize)]
+struct CreatedResponse<'a> {
+    id: &'a str,
+    object: &'static str,
+    created_at: u64,
+    status: &'static str,
+    background: bool,
+    model: &'a str,
+    /// No output items yet: `[]`.
+    output: [(); 0],
+}
+
+/// The `response.in_progress` event.
+#[derive(Serialize)]
+struct ResponseInProgress<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    response: InProgressResponse<'a>,
+}
+
+#[derive(Serialize)]
+struct InProgressResponse<'a> {
+    id: &'a str,
+    object: &'static str,
+    status: &'static str,
+}
+
+/// A content part's `added` and `done` events: the part's text is empty when
+/// the part is added and the whole accumulated text when it is done, borrowed
+/// rather than copied into a map.
+#[derive(Serialize)]
+struct ContentPartFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item_id: &'a str,
+    content_index: usize,
+    part: OutputTextPart<'a>,
+}
+
+#[derive(Serialize)]
+struct OutputTextPart<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+/// The `response.output_text.done` event: the whole text of the part, borrowed.
+#[derive(Serialize)]
+struct OutputTextDone<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item_id: &'a str,
+    content_index: usize,
+    text: &'a str,
+}
+
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
 /// Manages state and sequence numbers to emit proper event types:
@@ -315,20 +386,28 @@ impl ResponseStreamEventEmitter {
         seq
     }
 
-    pub fn emit_created(&mut self) -> serde_json::Value {
-        json!({
-            "type": ResponseEvent::CREATED,
-            "sequence_number": self.next_sequence(),
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "created_at": self.created_at,
-                "status": if self.background { "queued" } else { "in_progress" },
-                "background": self.background,
-                "model": self.model,
-                "output": []
-            }
-        })
+    /// `response.created`, the first frame of the stream, sent as
+    /// [`ResponseCreated`].
+    pub async fn send_created(&mut self, tx: &SseSender) -> Result<(), String> {
+        let sequence_number = self.next_sequence();
+        let event = ResponseCreated {
+            kind: ResponseEvent::CREATED,
+            sequence_number,
+            response: CreatedResponse {
+                id: &self.response_id,
+                object: "response",
+                created_at: self.created_at,
+                status: if self.background {
+                    "queued"
+                } else {
+                    "in_progress"
+                },
+                background: self.background,
+                model: &self.model,
+                output: [],
+            },
+        };
+        Self::send_frame(&mut self.encoder, ResponseEvent::CREATED, &event, tx).await
     }
 
     /// The event after `response.created` on a background stream: the
@@ -346,71 +425,100 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_in_progress(&mut self) -> serde_json::Value {
-        json!({
-            "type": ResponseEvent::IN_PROGRESS,
-            "sequence_number": self.next_sequence(),
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "status": "in_progress"
-            }
-        })
+    /// `response.in_progress`, sent as [`ResponseInProgress`].
+    pub async fn send_in_progress(&mut self, tx: &SseSender) -> Result<(), String> {
+        let sequence_number = self.next_sequence();
+        let event = ResponseInProgress {
+            kind: ResponseEvent::IN_PROGRESS,
+            sequence_number,
+            response: InProgressResponse {
+                id: &self.response_id,
+                object: "response",
+                status: "in_progress",
+            },
+        };
+        Self::send_frame(&mut self.encoder, ResponseEvent::IN_PROGRESS, &event, tx).await
     }
 
-    pub fn emit_content_part_added(
+    /// `content_part.added` for the text part, sent as [`ContentPartFrame`]
+    /// with an empty text.
+    pub async fn send_content_part_added(
         &mut self,
         output_index: usize,
         item_id: &str,
         content_index: usize,
-    ) -> serde_json::Value {
+        tx: &SseSender,
+    ) -> Result<(), String> {
         self.has_emitted_content_part_added = true;
-        json!({
-            "type": ContentPartEvent::ADDED,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": content_index,
-            "part": {
-                "type": "output_text",
-                "text": ""
-            }
-        })
+        let event = ContentPartFrame {
+            kind: ContentPartEvent::ADDED,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item_id,
+            content_index,
+            part: OutputTextPart {
+                kind: "output_text",
+                text: "",
+            },
+        };
+        Self::send_frame(&mut self.encoder, ContentPartEvent::ADDED, &event, tx).await
     }
 
-    pub fn emit_text_done(
+    /// `output_text.done` with the whole accumulated text, sent as
+    /// [`OutputTextDone`]; the text is borrowed, not copied.
+    pub async fn send_text_done(
         &mut self,
         output_index: usize,
         item_id: &str,
         content_index: usize,
-    ) -> serde_json::Value {
-        json!({
-            "type": OutputTextEvent::DONE,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": content_index,
-            "text": self.accumulated_text.clone()
-        })
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let sequence_number = self.next_sequence();
+        let event = OutputTextDone {
+            kind: OutputTextEvent::DONE,
+            sequence_number,
+            output_index,
+            item_id,
+            content_index,
+            text: &self.accumulated_text,
+        };
+        Self::send_frame(&mut self.encoder, OutputTextEvent::DONE, &event, tx).await
     }
 
-    pub fn emit_content_part_done(
+    /// `content_part.done` with the whole accumulated text, sent as
+    /// [`ContentPartFrame`]; the text is borrowed, not copied.
+    pub async fn send_content_part_done(
         &mut self,
         output_index: usize,
         item_id: &str,
         content_index: usize,
-    ) -> serde_json::Value {
-        json!({
-            "type": ContentPartEvent::DONE,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": content_index,
-            "part": {
-                "type": "output_text",
-                "text": self.accumulated_text.clone()
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let sequence_number = self.next_sequence();
+        let event = ContentPartFrame {
+            kind: ContentPartEvent::DONE,
+            sequence_number,
+            output_index,
+            item_id,
+            content_index,
+            part: OutputTextPart {
+                kind: "output_text",
+                text: &self.accumulated_text,
+            },
+        };
+        Self::send_frame(&mut self.encoder, ContentPartEvent::DONE, &event, tx).await
+    }
+
+    /// The outcome of a send for the streams that log a failed send instead
+    /// of ending on it: `true` when the event went out.
+    pub fn sent(result: Result<(), String>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
             }
-        })
+        }
     }
 
     // INVARIANT: this method is terminal — it drains internal state via `take()`
@@ -1131,10 +1239,9 @@ impl ResponseStreamEventEmitter {
             return Ok(());
         };
         if std::mem::take(&mut self.has_emitted_content_part_added) {
-            let event = self.emit_text_done(output_index, &item_id, 0);
-            self.send_event(&event, tx).await?;
-            let event = self.emit_content_part_done(output_index, &item_id, 0);
-            self.send_event(&event, tx).await?;
+            self.send_text_done(output_index, &item_id, 0, tx).await?;
+            self.send_content_part_done(output_index, &item_id, 0, tx)
+                .await?;
         }
         if std::mem::take(&mut self.has_emitted_output_item_added) {
             let item = json!({
@@ -1324,9 +1431,8 @@ impl ResponseStreamEventEmitter {
             let Some(item_id) = self.current_item_id.clone() else {
                 return Ok(());
             };
-            let event = self.emit_content_part_added(output_index, &item_id, content_index);
-            self.send_event(&event, tx).await?;
-            self.has_emitted_content_part_added = true;
+            self.send_content_part_added(output_index, &item_id, content_index, tx)
+                .await?;
         }
 
         // Emit text delta: the id borrowed from the emitter, the counter
@@ -1816,6 +1922,110 @@ mod tests {
             .starts_with("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":"));
     }
 
+    /// The five typed lifecycle events write the frames the `json!` events
+    /// wrote, byte for byte (the same keys in the same order, the same
+    /// escaping, the same sequence numbers), the text part's text included,
+    /// for a foreground response and for a background one (whose created
+    /// frame says `queued`).
+    #[tokio::test]
+    async fn the_typed_lifecycle_events_are_the_json_event_frames_byte_for_byte() {
+        let text = "h\u{e9}llo \"there\"\n\u{1F600}";
+        let frames = |mut emitter: ResponseStreamEventEmitter, typed: bool, background: bool| async move {
+            let (tx, mut rx) = sse_channel();
+            emitter.background = background;
+            emitter.accumulated_text.push_str(text);
+            if typed {
+                emitter.send_created(&tx).await.unwrap();
+                emitter.send_in_progress(&tx).await.unwrap();
+                emitter
+                    .send_content_part_added(2, "msg_1", 0, &tx)
+                    .await
+                    .unwrap();
+                emitter.send_text_done(2, "msg_1", 0, &tx).await.unwrap();
+                emitter
+                    .send_content_part_done(2, "msg_1", 0, &tx)
+                    .await
+                    .unwrap();
+            } else {
+                // The events as the `json!` maps wrote them before the typed forms.
+                let events = [
+                    json!({
+                        "type": ResponseEvent::CREATED,
+                        "sequence_number": emitter.next_sequence(),
+                        "response": {
+                            "id": emitter.response_id,
+                            "object": "response",
+                            "created_at": emitter.created_at,
+                            "status": if emitter.background { "queued" } else { "in_progress" },
+                            "background": emitter.background,
+                            "model": emitter.model,
+                            "output": []
+                        }
+                    }),
+                    json!({
+                        "type": ResponseEvent::IN_PROGRESS,
+                        "sequence_number": emitter.next_sequence(),
+                        "response": {
+                            "id": emitter.response_id,
+                            "object": "response",
+                            "status": "in_progress"
+                        }
+                    }),
+                    json!({
+                        "type": ContentPartEvent::ADDED,
+                        "sequence_number": emitter.next_sequence(),
+                        "output_index": 2,
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "part": { "type": "output_text", "text": "" }
+                    }),
+                    json!({
+                        "type": OutputTextEvent::DONE,
+                        "sequence_number": emitter.next_sequence(),
+                        "output_index": 2,
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "text": text
+                    }),
+                    json!({
+                        "type": ContentPartEvent::DONE,
+                        "sequence_number": emitter.next_sequence(),
+                        "output_index": 2,
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "part": { "type": "output_text", "text": text }
+                    }),
+                ];
+                for event in &events {
+                    emitter.send_event(event, &tx).await.unwrap();
+                }
+            }
+            drop(tx);
+            let mut frames = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                frames.push(bytes);
+            }
+            frames
+        };
+        let new = |created_at| {
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), created_at)
+        };
+        let json_frames = frames(new(3), false, false).await;
+        let typed_frames = frames(new(3), true, false).await;
+        assert_eq!(typed_frames.len(), 5);
+        assert_eq!(typed_frames, json_frames);
+        // A background response: the created frame says queued, in the same place.
+        let json_queued = frames(new(3), false, true).await;
+        let typed_queued = frames(new(3), true, true).await;
+        assert_eq!(typed_queued, json_queued);
+        assert!(std::str::from_utf8(&typed_queued[0])
+            .unwrap()
+            .contains("\"status\":\"queued\",\"background\":true,\"model\""));
+        assert!(std::str::from_utf8(&typed_frames[0])
+            .unwrap()
+            .starts_with("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_test\",\"object\":\"response\",\"created_at\":3,\"status\":\"in_progress\""));
+    }
+
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
     /// `event:` line.
@@ -1906,8 +2116,7 @@ mod tests {
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         let (tx, mut rx) = sse_channel();
-        let created = emitter.emit_created();
-        emitter.send_event(&created, &tx).await.unwrap();
+        emitter.send_created(&tx).await.unwrap();
         emitter
             .emit_error(
                 "Stream read error: connection reset",
