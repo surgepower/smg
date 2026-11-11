@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
+  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
+  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
+  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
+  read it.
 - `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
   `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
