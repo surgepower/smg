@@ -632,8 +632,13 @@ async fn v1_conversations_create(
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
-    conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
-        .await
+    conversations::create_conversation(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        tenant.as_deref(),
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_get(
