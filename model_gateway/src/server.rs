@@ -576,12 +576,14 @@ async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::get_response(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
@@ -616,12 +618,14 @@ async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::list_response_input_items(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
