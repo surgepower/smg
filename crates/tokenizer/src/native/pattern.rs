@@ -1840,14 +1840,18 @@ fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> b
             let mut at_start = at_start;
             nodes.iter().any(|node| {
                 let reads = reads_space_beyond_start(node, classes, at_start);
-                at_start = at_start && matches!(node, Node::NotAhead(_) | Node::NotAheadSeq { .. });
+                at_start = at_start
+                    && matches!(
+                        node,
+                        Node::NotAhead(_) | Node::NotAheadSeq { .. } | Node::End
+                    );
                 reads
             })
         }
         Node::Alt { alternatives, .. } => alternatives
             .iter()
             .any(|node| reads_space_beyond_start(node, classes, at_start)),
-        Node::NotAhead(_) | Node::NotAheadSeq { .. } => false,
+        Node::NotAhead(_) | Node::NotAheadSeq { .. } | Node::End => false,
         Node::UnitRun { first, second, .. } => space(first) || space(second),
         Node::JoinedTail { .. } | Node::JoinedRun { .. } => false,
     }
@@ -1865,7 +1869,7 @@ fn classes_of(node: &Node, out: &mut Vec<usize>) {
         } => {
             nodes.iter().for_each(|node| classes_of(node, out));
         }
-        Node::NotAhead(_) | Node::NotAheadSeq { .. } => {}
+        Node::NotAhead(_) | Node::NotAheadSeq { .. } | Node::End => {}
         Node::UnitRun { first, second, .. } => out.extend([*first, *second]),
         Node::JoinedTail { join, letter, mark } | Node::JoinedRun { join, letter, mark } => {
             out.extend([*join, *letter, *mark]);
@@ -1885,7 +1889,8 @@ fn joined_tail_loose(node: &Node) -> bool {
         | Node::NotAhead(_)
         | Node::NotAheadSeq { .. }
         | Node::UnitRun { .. }
-        | Node::JoinedRun { .. } => false,
+        | Node::JoinedRun { .. }
+        | Node::End => false,
         Node::Repeat { node, .. } => joined_tail_loose(node),
         Node::Concat(nodes) => nodes.iter().any(joined_tail_loose),
         Node::Alt { alternatives, .. } => alternatives.iter().any(joined_tail_loose),
@@ -1947,7 +1952,9 @@ fn holds_end(node: &Node) -> bool {
         | Node::NotAhead(_)
         | Node::GroupsAhead { .. }
         | Node::NotAheadSeq { .. }
-        | Node::UnitRun { .. } => false,
+        | Node::UnitRun { .. }
+        | Node::JoinedTail { .. }
+        | Node::JoinedRun { .. } => false,
         Node::Repeat { node, .. } => holds_end(node),
         Node::Concat(nodes) => nodes.iter().any(holds_end),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
