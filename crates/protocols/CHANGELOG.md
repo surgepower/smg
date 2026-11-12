@@ -68,6 +68,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   supported by this text-only backend`. The gateway's `400 unsupported_content_part` for a function
   output now names the part, as the same route's refusal of a message part does; the code and the
   status are unchanged.
+  The message reaches a client on both routes that read it: the chat-family Responses conversion
+  (`400 unsupported_content_part`) and the Harmony builder's tool message
+  (`400 harmony_build_failed`).
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
