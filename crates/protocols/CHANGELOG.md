@@ -6,6 +6,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
+  map of its pairs), `responses::validate_input_message_role` (an input message's role in the
+  public set) and `common::json_type_name` are public: a route that reads a metadata object or
+  stores message items of its own (the gateway's Conversations routes) validates them with the
+  rules the Responses request already validates with, in the same words and under the same codes.
 - `ChatCompletionRequest::dynamic_tools_for`, `declares_tools_for`, `effective_tool_list_for`,
   `shared_tool_list_for` and `callable_tools_for`: the tool-set readers under a provider profile
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
@@ -14,6 +19,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `metadata` value that is not a string is refused as `400 invalid_type`, naming the key and the
+  type sent (`Invalid type for 'metadata.k': expected a string, but got an object instead.`), as
+  the public API refuses one; before, a request's `metadata` passed validation with an object, a
+  number, a boolean or a null value under a key.
 - Breaking: `ResponseFormat::JsonSchema` carries `Box<JsonSchemaFormat>` and
   `ResponseFormat::StructuralTag` carries `Box<serde_json::Map<String, Value>>`. A format had
   grown from 104 to 128 bytes when the schema kept its description and the structural tag
