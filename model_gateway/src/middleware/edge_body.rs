@@ -16,13 +16,13 @@
 //!
 //! The hand-over rides on the response's extensions, so it holds across the
 //! layers that keep them. A layer between a producer and the edge that
-//! builds the response again from scratch (the WASM middleware's reject and
-//! modify phases do, with `Response::builder()`) drops the duties handed so
-//! far with the old response: the permit and the keep-alive end there, as
-//! their in-body wrappers did when such a layer drained the old body, and
-//! the span closes with the head (`BodyDuties`' drop). A layer that
-//! replaces the body but keeps the parts (the Messages error envelope) keeps
-//! them.
+//! built the response again from scratch (the WASM middleware's reject and
+//! modify phases did, with `Response::builder()`) dropped the duties handed
+//! so far with the old response: the permit and the keep-alive ended there,
+//! as their in-body wrappers did when such a layer drained the old body, and
+//! the span closed with the head (`BodyDuties`' drop). A layer that replaces
+//! the body but keeps the parts (the Messages error envelope, the WASM hooks
+//! now) keeps them.
 //!
 //! The duties end as they did. At the body's end (its last frame, the length
 //! the response declared, or an error of the body) the response is counted,
