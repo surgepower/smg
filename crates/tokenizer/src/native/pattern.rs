@@ -253,6 +253,15 @@ fn in_categories(categories: u16, code: u32) -> bool {
 }
 
 impl Class {
+    /// Whether two finished classes are the same set: the same categories,
+    /// exclusions, negation and (sorted, merged) ranges.
+    fn same_set(&self, other: &Self) -> bool {
+        self.negated == other.negated
+            && self.categories == other.categories
+            && self.without == other.without
+            && self.ranges == other.ranges
+    }
+
     fn finish(mut self) -> Self {
         // `in_ranges` binary-searches on the ends in start order: a range
         // inside another breaks that, so the ranges are sorted here, once
@@ -402,6 +411,26 @@ pub(super) enum Node {
         size: u32,
         word: usize,
     },
+    /// `(?!XY)` or `(?!X?Y)` over two classes, at most two characters read
+    /// ahead: fails when the next character is in `first` and the one after
+    /// in `second`, or, with the first optional, when the next is in
+    /// `second`.
+    NotAheadSeq {
+        first: usize,
+        first_optional: bool,
+        second: usize,
+    },
+    /// `(?:X?Y)+`, or `(?:X?Y){n,}`: a greedy run of at least `min` units,
+    /// each one character of `second` or one of `first` then one of
+    /// `second`, taken whole. It stands at the end of its alternative or
+    /// before the negative lookahead over its own unit
+    /// ([`unit_run_misplaced`]): there the engine's greedy repeat never has
+    /// a unit to give back, so the longest run is the match.
+    UnitRun {
+        first: usize,
+        second: usize,
+        min: u32,
+    },
 }
 
 /// The characters a match of a node can begin with: a table of the ASCII
@@ -510,6 +539,20 @@ enum Op {
         size: u32,
         word: usize,
     },
+    /// Succeeds unless the next character is in `first` and the one after
+    /// in `second`, or, with the first optional, the next is in `second`.
+    NotAheadSeq {
+        first: usize,
+        first_optional: bool,
+        second: usize,
+    },
+    /// A greedy run of at least `min` units, each one character of `second`
+    /// or one of `first` then one of `second`; taken whole, no choice left.
+    UnitRun {
+        first: usize,
+        second: usize,
+        min: u32,
+    },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
@@ -593,7 +636,10 @@ impl Pattern {
         if parser.chars.next().is_some() {
             return None;
         }
-        if can_match_empty(&root) || groups_ahead_leads(&root, true) {
+        if can_match_empty(&root)
+            || groups_ahead_leads(&root, true)
+            || unit_run_misplaced(&root, &parser.classes, Follow::Nothing)
+        {
             return None;
         }
         first_sets(&mut root, &parser.classes);
@@ -881,6 +927,56 @@ impl Pattern {
                         false
                     } else {
                         true
+                    }
+                }
+                Op::NotAheadSeq {
+                    first,
+                    first_optional,
+                    second,
+                } => {
+                    let ahead = match next_char(text, pos) {
+                        Some((c, len)) => {
+                            (first_optional && self.classes[second].contains(c))
+                                || (self.classes[first].contains(c)
+                                    && next_char(text, pos + len)
+                                        .is_some_and(|(d, _)| self.classes[second].contains(d)))
+                        }
+                        None => false,
+                    };
+                    if ahead {
+                        true
+                    } else {
+                        pc += 1;
+                        false
+                    }
+                }
+                Op::UnitRun { first, second, min } => {
+                    let mut count = 0u32;
+                    let mut p = pos;
+                    loop {
+                        match next_char(text, p) {
+                            Some((c, len)) if self.classes[second].contains(c) => {
+                                p += len;
+                                count += 1;
+                            }
+                            Some((c, len)) if self.classes[first].contains(c) => {
+                                match next_char(text, p + len) {
+                                    Some((d, n)) if self.classes[second].contains(d) => {
+                                        p += len + n;
+                                        count += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if count < min {
+                        true
+                    } else {
+                        pos = p;
+                        pc += 1;
+                        false
                     }
                 }
                 Op::Split { next, first } => {
@@ -1434,6 +1530,20 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             size: *size,
             word: *word,
         }),
+        Node::NotAheadSeq {
+            first,
+            first_optional,
+            second,
+        } => program.push(Op::NotAheadSeq {
+            first: *first,
+            first_optional: *first_optional,
+            second: *second,
+        }),
+        Node::UnitRun { first, second, min } => program.push(Op::UnitRun {
+            first: *first,
+            second: *second,
+            min: *min,
+        }),
     }
 }
 
@@ -1441,7 +1551,12 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
     match node {
-        Node::Class(_) | Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => 0,
+        Node::Class(_)
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::GroupsAhead { .. }
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. } => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
             if *max == 0 {
@@ -1515,7 +1630,8 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
         Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
-        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => true,
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } | Node::NotAheadSeq { .. } => true,
+        Node::UnitRun { min, .. } => *min == 0,
     }
 }
 
@@ -1539,7 +1655,12 @@ fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
             .iter()
             .any(|alternative| groups_ahead_leads(alternative, leading)),
         Node::Repeat { node, .. } => groups_ahead_leads(node, leading),
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. } => false,
     }
 }
 
@@ -1547,7 +1668,12 @@ fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
 fn holds_groups_ahead(node: &Node) -> bool {
     match node {
         Node::GroupsAhead { .. } => true,
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. } => false,
         Node::Repeat { node, .. } => holds_groups_ahead(node),
         Node::Concat(nodes) => nodes.iter().any(holds_groups_ahead),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_groups_ahead),
@@ -1562,10 +1688,69 @@ fn holds_end(node: &Node) -> bool {
         Node::Class(_)
         | Node::ClassRepeat { .. }
         | Node::NotAhead(_)
-        | Node::GroupsAhead { .. } => false,
+        | Node::GroupsAhead { .. }
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. } => false,
         Node::Repeat { node, .. } => holds_end(node),
         Node::Concat(nodes) => nodes.iter().any(holds_end),
         Node::Alt { alternatives, .. } => alternatives.iter().any(holds_end),
+    }
+}
+
+/// What follows a node to the end of its top-level alternative, as far as
+/// a [`Node::UnitRun`] is concerned.
+#[derive(Clone, Copy)]
+enum Follow<'a> {
+    /// Nothing: the alternative ends with the node.
+    Nothing,
+    /// One negative lookahead and then nothing.
+    Lookahead(&'a Node),
+    /// Anything else.
+    Other,
+}
+
+/// Whether a [`Node::UnitRun`] sits where the engine's greedy repeat could
+/// give a unit back to what follows, which the run never does: anything
+/// but the end of its alternative or the negative lookahead over the run's
+/// own unit (`(?!X?Y)`, `(?!XY)` or `(?!Y)` with the run's classes), which
+/// holds after a maximal run by construction. Such a pattern declines.
+fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> bool {
+    match node {
+        Node::UnitRun { first, second, .. } => match follow {
+            Follow::Nothing => false,
+            Follow::Lookahead(Node::NotAhead(class)) => {
+                !classes[*class].same_set(&classes[*second])
+            }
+            Follow::Lookahead(Node::NotAheadSeq {
+                first: ahead_first,
+                second: ahead_second,
+                ..
+            }) => {
+                !(classes[*ahead_first].same_set(&classes[*first])
+                    && classes[*ahead_second].same_set(&classes[*second]))
+            }
+            Follow::Lookahead(_) | Follow::Other => true,
+        },
+        Node::Concat(nodes) => nodes.iter().enumerate().any(|(i, node)| {
+            let rest = &nodes[i + 1..];
+            let next = match (rest, follow) {
+                ([], follow) => follow,
+                ([lookahead @ (Node::NotAhead(_) | Node::NotAheadSeq { .. })], Follow::Nothing) => {
+                    Follow::Lookahead(lookahead)
+                }
+                _ => Follow::Other,
+            };
+            unit_run_misplaced(node, classes, next)
+        }),
+        Node::Alt { alternatives, .. } => alternatives
+            .iter()
+            .any(|alternative| unit_run_misplaced(alternative, classes, follow)),
+        Node::Repeat { node, .. } => unit_run_misplaced(node, classes, Follow::Other),
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::End => false,
     }
 }
 
@@ -1613,9 +1798,15 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
                 .iter()
                 .fold(First::default(), |all, first| all.or(*first))
         }
-        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => First {
-            nullable: true,
-            ..First::default()
+        Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } | Node::NotAheadSeq { .. } => {
+            First {
+                nullable: true,
+                ..First::default()
+            }
+        }
+        Node::UnitRun { first, second, min } => First {
+            nullable: *min == 0,
+            ..classes[*first].first().or(classes[*second].first())
         },
     }
 }
@@ -1778,10 +1969,21 @@ impl Parser<'_> {
                 max,
                 possessive,
             },
-            Node::NotAhead(_) | Node::End | Node::GroupsAhead { .. } => return None,
+            Node::NotAhead(_)
+            | Node::End
+            | Node::GroupsAhead { .. }
+            | Node::NotAheadSeq { .. }
+            | Node::UnitRun { .. } => return None,
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
             _ if possessive => return None,
+            // `(?:X?Y)+` (`{n,}` too): a run of units taken whole, accepted at
+            // the end of its alternative or before the lookahead over its own
+            // unit (see `unit_run_misplaced`).
+            Node::Concat(ref nodes) if min >= 1 && max == u32::MAX => match Self::unit_of(nodes) {
+                Some((first, second)) => Node::UnitRun { first, second, min },
+                None => return None,
+            },
             // A group that repeats would need the engine's rule for an empty
             // iteration and an unbounded choice stack: only the optional form
             // is accepted, longer runs stay with `tokenizers`.
@@ -1874,11 +2076,36 @@ impl Parser<'_> {
                     '[' => self.parse_class_body()?,
                     _ => return None,
                 };
+                // A second class makes the sequence lookahead `(?!XY)`, its
+                // first character optional under `?` (`(?!\r?\n)`); anything
+                // wider declines.
+                let first_optional = self.chars.peek() == Some(&'?');
+                if first_optional {
+                    self.chars.next();
+                }
+                let next = self.chars.next()?;
+                if next == ')' {
+                    if first_optional {
+                        return None;
+                    }
+                    let class = self.add_class(class);
+                    return Some(Node::NotAhead(class));
+                }
+                let second = match next {
+                    '\\' => self.parse_escape_as_class()?,
+                    '[' => self.parse_class_body()?,
+                    _ => return None,
+                };
                 if self.chars.next()? != ')' {
                     return None;
                 }
-                let class = self.add_class(class);
-                Some(Node::NotAhead(class))
+                let first = self.add_class(class);
+                let second = self.add_class(second);
+                Some(Node::NotAheadSeq {
+                    first,
+                    first_optional,
+                    second,
+                })
             }
             '=' => self.parse_groups_ahead(),
             _ => None,
@@ -1923,6 +2150,20 @@ impl Parser<'_> {
             }
         };
         Some(Node::GroupsAhead { class, size, word })
+    }
+
+    /// The classes of a unit `X?Y` (an optional class, then a class), when
+    /// `nodes` are exactly that.
+    fn unit_of(nodes: &[Node]) -> Option<(usize, usize)> {
+        match nodes {
+            [Node::ClassRepeat {
+                class: first,
+                min: 0,
+                max: 1,
+                possessive: false,
+            }, Node::Class(second)] => Some((*first, *second)),
+            _ => None,
+        }
     }
 
     /// A group whose alternatives are each one character of a class
@@ -2201,7 +2442,11 @@ mod tests {
     /// characters, the joiners as code-point escapes.
     const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 20] = [
+    /// A line-break stage: runs of `\n` or `\r\n`, each taken whole, the
+    /// lookahead holding at the run's end as the engine finds it.
+    const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
+
+    const PATTERNS: [&str; 21] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -2222,6 +2467,7 @@ mod tests {
         END_LETTERS,
         END_GROUP,
         DIGIT_GROUPS,
+        LINE_BREAK_RUNS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -2508,6 +2754,26 @@ mod tests {
             r"\s+$|^a",
             r"a$?",
             r"(?:a|$)",
+            // a sequence lookahead outside the two-character shape
+            r"a(?!b?)",
+            r"a(?!\r?\n?)",
+            r"a(?!\r\n\n)",
+            r"a(?!ab)",
+            r"a(?!\r?\n)+",
+            // a run of units with something after it that is not the lookahead
+            // over its own unit (the engine may give a unit back to it)
+            r"(?:\r?\n)+a",
+            r"(?:\r?\n)+(?!\r?\n)a",
+            r"(?:\r?\n)+(?!\S)",
+            r"(?:\r?\n)+(?!\r)",
+            r"(?:\r?\n)+(?!\n\r)",
+            r"(?:\r?\n)+(?!\r?\n)(?!\S)",
+            r"(?:[a]?[b])+(?![c])",
+            r"(?:\r?\n)+|(?:\r?\n)+b",
+            r"(?:\r?\n){2}",
+            r"(?:\r?\n)++",
+            r"(?:\r?\n)+?",
+            r"(?:(?:\r?\n)+)?",
         ] {
             assert!(Pattern::parse(pattern).is_none(), "{pattern}");
         }
@@ -2624,6 +2890,58 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// A run of line-break units and the two-character lookahead after it
+    /// cut as the engine cuts them: runs of `\n` and `\r\n` whole, a lone
+    /// `\r` left out, the lookahead reading `\n` and `\r\n` and nothing
+    /// else, at the end too.
+    #[test]
+    fn line_break_runs_and_the_sequence_lookahead_cut_as_the_engine_does() {
+        fn cuts_of(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+            Pattern::parse(pattern)
+                .expect("parses")
+                .find_iter(text)
+                .collect()
+        }
+        for (pattern, text) in [
+            (LINE_BREAK_RUNS, "a\nb\r\nc\rd\n\n\ne\r\n\r\nf\n"),
+            (LINE_BREAK_RUNS, "\n"),
+            (LINE_BREAK_RUNS, "\r"),
+            (LINE_BREAK_RUNS, "\r\n\r"),
+            (LINE_BREAK_RUNS, "x\n\r\r\n\n"),
+            (LINE_BREAK_RUNS, "\r\r\n"),
+            (LINE_BREAK_RUNS, "no break"),
+            (LINE_BREAK_RUNS, ""),
+            (r"[a-z]+(?!\r?\n)", "ab\ncd\r\nef\rgh"),
+            (r"[a-z]+(?![b][c])", "abc abd ab a"),
+            (r"(?:[ab]?[c])+(?![ab]?[c])", "cacbcc acbc x"),
+            (r"(?:[ab]?[c])+(?![c])", "cacbcc acbc x"),
+            (r"(?:[ab]?[c])+", "cacbcc acbc x"),
+        ] {
+            assert_eq!(
+                cuts_of(pattern, text),
+                oracle_matches(pattern, text),
+                "{pattern} on {text:?}"
+            );
+        }
+        assert_eq!(
+            cuts_of(LINE_BREAK_RUNS, "a\nb\r\nc\rd\n\n\ne"),
+            vec![(1, 2), (3, 5), (8, 11)]
+        );
+        let parsed = Pattern::parse(LINE_BREAK_RUNS).expect("parses");
+        assert!(matches!(parsed.matcher, Matcher::Program));
+        assert!(parsed
+            .program
+            .iter()
+            .any(|op| matches!(op, Op::UnitRun { min: 1, .. })));
+        assert!(parsed.program.iter().any(|op| matches!(
+            op,
+            Op::NotAheadSeq {
+                first_optional: true,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -3353,16 +3671,17 @@ mod tests {
     #[test]
     fn group_repeats_and_long_runs_on_a_small_stack() {
         // A group under `+`, `*` or `{n,}` is declined (its choices would
-        // grow with the run); the optional form and class runs each leave one
-        // choice on a stack sized at parse time, so a match uses no stack
-        // frame per repetition or per character and long inputs match on a
-        // 256 KiB stack.
+        // grow with the run), but for the unit run at the end of its
+        // alternative, taken whole by one op; the optional form and
+        // class runs each leave one choice on a stack sized at parse time, so
+        // a match uses no stack frame per repetition or per character and
+        // long inputs match on a 256 KiB stack.
         let worker = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(|| {
                 for pattern in [
-                    r"(?:\r?\n)+",
-                    r"(?: ?\p{L})+",
+                    r"(?:\r?\n)+x",
+                    r"(?: ?\p{L})+\p{N}",
                     r"(?:ab)*",
                     r"(?:ab|c){2,}",
                     r"(?:'s){1,3}",
@@ -3370,7 +3689,7 @@ mod tests {
                     assert!(Pattern::parse(pattern).is_none(), "{pattern}");
                 }
                 let text = "\r\n".repeat(50_000) + &" x".repeat(50_000) + &"'s".repeat(5_000);
-                for pattern in [GPT2, QWEN35, CASED] {
+                for pattern in [GPT2, QWEN35, CASED, LINE_BREAK_RUNS] {
                     let parsed = Pattern::parse(pattern).expect("parses");
                     let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
                     assert_eq!(ours, oracle_matches(pattern, &text), "{pattern}");
