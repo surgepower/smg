@@ -61,6 +61,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
+  `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
+  "input_image" in a function output for text-only backends: only text parts are carried as a tool
+  result`, where every such part answered the one fixed message `Multimodal function output is not
+  supported by this text-only backend`. The gateway's `400 unsupported_content_part` for a function
+  output now names the part, as the same route's refusal of a message part does; the code and the
+  status are unchanged.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
