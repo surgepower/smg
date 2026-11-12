@@ -1,12 +1,21 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, RecycleError, RecycleResult};
-use oracle::{sql_type::ToSql, Connection, Connector, Row};
+use oracle::{sql_type::ToSql, ConnStatus, Connection, Connector, ErrorKind, Row};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use super::core::{
     make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
@@ -92,14 +101,25 @@ impl OracleStore {
 
         drop(conn);
 
-        // Create connection pool
+        // Create connection pool. Each call as a whole is bounded by the
+        // `bounded` wrappers the factory installs. The pool and the driver
+        // bound their own steps (creating a connection, recycling one, each
+        // round trip of a connection) at twice that bound: backstops that
+        // clean up after a call the wrapper has already answered, never the
+        // first to fire.
+        let backstop = config.op_timeout().saturating_mul(2);
         let config_arc = Arc::new(config.clone());
         let manager = OracleConnectionManager {
             params: Arc::new(OracleConnectParams::from_config(&config_arc)),
+            call_timeout: backstop,
+            call_timeout_refused: Arc::new(AtomicBool::new(false)),
+            connects: Arc::new(Semaphore::new(config.pool_max)),
         };
 
         let mut builder = Pool::builder(manager)
             .max_size(config.pool_max)
+            .create_timeout(Some(backstop))
+            .recycle_timeout(Some(backstop))
             .runtime(deadpool::Runtime::Tokio1);
 
         if config.pool_timeout_secs > 0 {
@@ -258,6 +278,18 @@ impl std::fmt::Debug for OracleConnectParams {
 #[derive(Clone)]
 struct OracleConnectionManager {
     params: Arc<OracleConnectParams>,
+    /// The driver's own bound on each round trip of a pooled connection:
+    /// twice the store-call bound, the backstop behind the wrapper's verdict.
+    call_timeout: Duration,
+    /// Set once the driver refused the call timeout (a client library older
+    /// than the one that bounds its calls), so the warning is logged once.
+    call_timeout_refused: Arc<AtomicBool>,
+    /// At most `pool_max` connects at a time. The pool gives its slot back
+    /// when a bound drops the checkout, the connect's thread runs on: the
+    /// permit rides on that thread and returns when the driver does, so a
+    /// store frozen at connect holds at most `pool_max` blocking threads and
+    /// the next connect waits here, where a bound can end the wait.
+    connects: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for OracleConnectionManager {
@@ -277,20 +309,64 @@ impl Manager for OracleConnectionManager {
         &self,
     ) -> impl std::future::Future<Output = Result<Connection, oracle::Error>> + Send {
         let params = self.params.clone();
+        let call_timeout = self.call_timeout;
+        let refused = self.call_timeout_refused.clone();
+        let connects = self.connects.clone();
         async move {
-            let mut conn = connect_oracle(
-                params.external_auth,
-                &params.username,
-                &params.password,
-                &params.connect_descriptor,
-            )?;
-            conn.set_autocommit(true);
-            Ok(conn)
+            // A connect permit first (an async wait a bound can end); it is
+            // dropped by the connect's thread when the driver returns.
+            let permit = connects.acquire_owned().await.map_err(|closed| {
+                oracle::Error::new(
+                    ErrorKind::Other,
+                    format!("the connect limiter is closed: {closed}"),
+                )
+            })?;
+            // The driver connects synchronously: on a blocking thread, so the
+            // checkout's future yields and the bound around the call can end
+            // the wait (the thread returns when the driver does).
+            tokio::task::spawn_blocking(move || {
+                let _connect_slot = permit;
+                let mut conn = connect_oracle(
+                    params.external_auth,
+                    &params.username,
+                    &params.password,
+                    &params.connect_descriptor,
+                )?;
+                conn.set_autocommit(true);
+                // The driver's own bound on every round trip of this
+                // connection: a statement or a ping the store never answers
+                // ends here, and the thread and the connection come back.
+                if let Err(err) = conn.set_call_timeout(Some(call_timeout)) {
+                    if !refused.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "Oracle client library refused the call timeout of {call_timeout:?} ({err}); \
+                             a round trip the store never answers holds its thread and connection until the socket ends"
+                        );
+                    }
+                }
+                Ok::<Connection, oracle::Error>(conn)
+            })
+            .await
+            .map_err(|join| {
+                oracle::Error::new(
+                    ErrorKind::Other,
+                    format!("the connect thread failed: {join}"),
+                )
+            })?
         }
     }
 
     async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<Self::Error> {
-        conn.ping().map_err(RecycleError::Backend)
+        // The driver's local view of the connection, no round trip: the
+        // Postgres pool's `Fast` recycling, one round trip fewer per call and
+        // nothing synchronous on the runtime thread. A connection the store
+        // dropped without the client noticing fails its next statement, which
+        // the call answers as the store's failure.
+        match conn.status() {
+            Ok(ConnStatus::Normal) => Ok(()),
+            Ok(status) => Err(RecycleError::message(format!("connection {status:?}"))),
+            Err(err) => Err(RecycleError::Backend(err)),
+        }
     }
 }
 
