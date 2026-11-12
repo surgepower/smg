@@ -8,11 +8,14 @@ use std::{
 };
 
 use axum::response::Response;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, Stream, StreamExt},
+};
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -332,7 +335,7 @@ pub(crate) async fn execute_plan(
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger, None).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
@@ -475,6 +478,9 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Dispatch a disaggregated request by its runtime's PD protocol. `encode`
+/// is the watch on an EPD request's encode dispatch (see
+/// [`launch_encode_dispatch`]), `None` for every other request.
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -482,6 +488,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -522,10 +529,27 @@ async fn execute_pd_dispatch(
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    encode,
+                )
+                .await
             }
             None => {
-                execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    encode,
+                )
+                .await
             }
         },
     }?;
@@ -589,6 +613,7 @@ async fn execute_fanout_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -604,7 +629,8 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger).await }
+        let encode = encode.clone();
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -658,7 +684,8 @@ async fn execute_fanout_pd(
 
 /// Dispatch an EPD request by the encode stage's plan: a push plan's encoder
 /// completes before the prefill/decode pair is sent; a rendezvous plan's
-/// encode jobs launch beside the pair.
+/// encode jobs launch beside the pair, and a failure of their dispatch ends
+/// the prefill side's wait (see [`launch_encode_dispatch`]).
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -669,6 +696,7 @@ async fn execute_epd_dispatch(
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = None;
+    let mut encode_watch = None;
     match encode {
         // The built prompt goes to the encoder first; its completion has
         // replaced the pixels by the time the prefill side sees it.
@@ -678,7 +706,7 @@ async fn execute_epd_dispatch(
         // The encode jobs go beside the prefill/decode pair; the prefill side
         // drops its pixels, its embeddings come from the encode workers.
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
-            spawn_encode_dispatch(dispatch);
+            encode_watch = launch_encode_dispatch(dispatch);
             proto_request.clear_mm_pixel_values();
         }
         // Text-only, or a retry whose first dispatch took the plan.
@@ -691,6 +719,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        encode_watch,
     )
     .await;
     if result.is_ok() {
@@ -703,17 +732,41 @@ async fn execute_epd_dispatch(
     result
 }
 
+/// The watch on an EPD request's encode dispatch: `None` until a send has
+/// failed, then the first failure's words (see [`launch_encode_dispatch`]).
+pub(crate) type EncodeWatch = watch::Receiver<Option<String>>;
+
+/// The watch on an EPD request's encode dispatch as the parallel dispatch
+/// races it beside both sides (see [`dispatch_pd_sides`]), with what the
+/// prefill side's verdict needs: the worker the side was sent to, its
+/// connection label and the request.
+struct EncodeRace {
+    watch: EncodeWatch,
+    worker: Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: String,
+}
+
+/// Launch a rendezvous plan's encode jobs beside the prefill/decode pair and
+/// supervise them in the background. The prefill side blocks on the
+/// embedding receive; a job the encoder never took (the connection failed,
+/// the RPC was refused, the request was not accepted) leaves nothing at the
+/// rendezvous, so the first such failure is published on the returned watch
+/// the moment it lands and the prefill side's wait ends on it (the dispatch
+/// phase in [`dispatch_pd_sides`], the first-response phase in
+/// [`first_prefill_response_within`]) instead of running to its silence
+/// bound. `None` for an empty plan.
 #[expect(
     clippy::disallowed_methods,
     reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
-fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
+fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
     if encode_dispatch.is_empty() {
-        return;
+        return None;
     }
 
     let num_encode_items = encode_dispatch.len();
-    let sends: Vec<_> = encode_dispatch
+    let sends: FuturesUnordered<_> = encode_dispatch
         .into_jobs()
         .into_iter()
         .map(|job| tokio::spawn(async move { job.dispatch().await }))
@@ -724,27 +777,67 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
         "EPD encode dispatch issued with prefill/decode"
     );
 
-    tokio::spawn(async move {
-        for join_res in join_all(sends).await {
-            match join_res {
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    error!(
-                        function = "execute_epd_dispatch",
-                        error = %message,
-                        "Backend encode dispatch failed after EPD dispatch; embedding-receive timeout will abort the request"
-                    );
-                }
-                Err(join_err) => {
-                    error!(
-                        function = "execute_epd_dispatch",
-                        error = %join_err,
-                        "Encode dispatch task panicked after EPD dispatch"
-                    );
-                }
-            }
+    // Each send's outcome as it lands, a panicked task counted as a failed
+    // send: one refused encoder is published while its siblings still run.
+    let outcomes = sends.map(|join_res| match join_res {
+        Ok(outcome) => outcome,
+        Err(join_err) => {
+            error!(
+                function = "execute_epd_dispatch",
+                error = %join_err,
+                "Encode dispatch task panicked after EPD dispatch"
+            );
+            Err(join_err.to_string())
         }
     });
+    let (failed_tx, failed_rx) = watch::channel(None);
+    tokio::spawn(supervise_encode_sends(outcomes, failed_tx));
+    Some(failed_rx)
+}
+
+/// Supervise an EPD request's encode sends: the first failure among
+/// `outcomes` goes on `failed` the moment it lands, a sibling still in
+/// flight notwithstanding; later failures are logged. Nobody listening (the
+/// side answered, or failed on its own) is fine.
+async fn supervise_encode_sends(
+    mut outcomes: impl Stream<Item = Result<(), String>> + Unpin,
+    failed: watch::Sender<Option<String>>,
+) {
+    while let Some(outcome) = outcomes.next().await {
+        let Err(failure) = outcome else {
+            continue;
+        };
+        error!(
+            function = "execute_epd_dispatch",
+            error = %failure,
+            "Backend encode dispatch failed after EPD dispatch; the prefill side's wait ends on it"
+        );
+        failed.send_if_modified(|failed| {
+            if failed.is_none() {
+                *failed = Some(failure);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Wait for the encode dispatch `watch` to report a failure, and give its
+/// words. Pending for good without a watch, and once the supervisor has
+/// gone without a failure (every job was taken).
+async fn encode_dispatch_failed(watch: Option<&mut EncodeWatch>) -> String {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(failure) = &*watch.borrow_and_update() {
+            return failure.clone();
+        }
+        if watch.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
 }
 
 /// Dispatch one backend request per batched prompt concurrently, preserving
@@ -792,6 +885,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            None,
                         )
                         .await
                     }
@@ -1019,6 +1113,7 @@ async fn execute_parallel_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1048,7 +1143,8 @@ async fn execute_parallel_pd(
     // the admission gate claimed for it) until its own timeout.
     let prefill_worker = workers.prefill_worker();
     let bound = prefill_worker
-        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start))
+        .map(|bound| bound.watching_encode(encode.clone()));
     // Each side owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the side still in flight when
     // its partner fails can be moved off the request path.
@@ -1118,7 +1214,17 @@ async fn execute_parallel_pd(
 
     // The prefill worker's handoffs are watched for only where its side has a bound.
     let handoff_to = bound.as_ref().and(prefill_worker);
-    match dispatch_pd_sides(prefill_dispatch, decode_dispatch, handoff_to).await {
+    // The request's encode dispatch is raced beside both sides' dispatches,
+    // bound or not (the bound races it again for the prefill's first response).
+    let encode_race = encode
+        .zip(prefill_worker.cloned())
+        .map(|(watch, worker)| EncodeRace {
+            watch,
+            worker,
+            connection: sides.prefill_label,
+            request_id: sides.request_id.clone(),
+        });
+    match dispatch_pd_sides(prefill_dispatch, decode_dispatch, handoff_to, encode_race).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             parallel_sides_answered(
                 &sides,
@@ -1203,20 +1309,21 @@ async fn parallel_sides_answered(
     // Both sides are translated before either is propagated: a
     // decode-side failure is logged and counted even when the prefill
     // error is the one the client sees.
-    let prefill_silence = prefill_result
-        .as_ref()
-        .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
+    let prefill_silence = prefill_result.as_ref().is_err_and(|e| {
+        is_prefill_silence(e) || is_decode_silence(e) || is_encode_dispatch_failure(e)
+    });
     let prefill = prefill_result
         .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
     let decode =
         decode_result.map_err(|e| pd_side_error(PdSide::Decode, sides.decode_label, &e, workers));
     let (prefill_stream, mut decode_stream) = match (prefill, decode) {
         (Ok(prefill), Ok(decode)) => (prefill, decode),
-        // A prefill given up on for a silence verdict (its own, or
-        // its stalled decode partner's) may yet start the handoff
-        // into the decode's room: the decode's abort is deferred
-        // until its first item, as the other two paths of the
-        // verdict defer it (30 s at most), not fired by the drop.
+        // A prefill given up on for a verdict (its own silence, its
+        // stalled decode partner's, or its request's failed encode
+        // dispatch) may yet start the handoff into the decode's
+        // room: the decode's abort is deferred until its first item,
+        // as the other two paths of the verdict defer it (30 s at
+        // most), not fired by the drop.
         (Err(response), Ok(decode)) if prefill_silence => {
             drop(decode.defer_abort_until_first_item());
             return Err(response);
@@ -1337,8 +1444,14 @@ fn parallel_side_failed_first(
         // the decode is waiting for) and uncharged: a late failure
         // of a handoff that never came is not the decode's fault.
         // The decode partner the verdict charged for stalling is
-        // retired the same way: charged once, at the verdict.
-        let retirement = if is_prefill_silence(error) || is_decode_silence(error) {
+        // retired the same way: charged once, at the verdict. A
+        // prefill given up on for its request's failed encode
+        // dispatch leaves its partner the same way: a job the
+        // encoder took after all could still start the handoff.
+        let retirement = if is_prefill_silence(error)
+            || is_decode_silence(error)
+            || is_encode_dispatch_failure(error)
+        {
             Retirement::PartnerSilent
         } else {
             Retirement::PartnerFailed
@@ -1372,6 +1485,7 @@ async fn dispatch_pd_sides(
     mut prefill: SideDispatch,
     mut decode: SideDispatch,
     handoff_to: Option<&Arc<dyn Worker>>,
+    mut encode: Option<EncodeRace>,
 ) -> PdDispatchOutcome {
     /// One turn of the dispatch loop. The `select!` handlers may only
     /// classify — moving a still-pending side out happens after the macro's
@@ -1386,6 +1500,9 @@ async fn dispatch_pd_sides(
         /// The decode side's first item came while the prefill side was
         /// still dispatching: whether it was output, a handoff.
         Witnessed(bool),
+        /// The request's encode dispatch failed: the prefill side is given
+        /// up on, whatever either side has answered.
+        EncodeFailed(String),
     }
 
     // At most one of these is `Some` at the top of the loop: the second
@@ -1397,13 +1514,17 @@ async fn dispatch_pd_sides(
 
     loop {
         let witnessing = watching && prefill_result.is_none() && decode_result.is_some();
-        // Biased: the decode side's first item, then the decode side, then
-        // the prefill side, so a decode answer (and the item a servicer that
-        // holds its headers sends with it) landing in the wakeup of the
-        // prefill side's deadline is credited before the side is judged.
-        // Each comes once, so neither starves the prefill side.
+        // Biased: the request's encode failure first (the embedding is not
+        // coming, whatever the sides have answered), then the decode side's
+        // first item, then the decode side, then the prefill side, so a
+        // decode answer (and the item a servicer that holds its headers
+        // sends with it) landing in the wakeup of the prefill side's
+        // deadline is credited before the side is judged. Each comes once,
+        // so neither starves the prefill side.
         let step = tokio::select! {
             biased;
+            failure = encode_dispatch_failed(encode.as_mut().map(|race| &mut race.watch)),
+                if encode.is_some() => DispatchStep::EncodeFailed(failure),
             handed_off = decode_handed_off(decode_result.as_mut().and_then(|r| r.as_mut().ok())),
                 if witnessing => DispatchStep::Witnessed(handed_off),
             result = &mut decode, if decode_result.is_none() => match result {
@@ -1417,6 +1538,38 @@ async fn dispatch_pd_sides(
         };
 
         match step {
+            DispatchStep::EncodeFailed(failure) => {
+                // The arm exists only with a race: take it for the verdict.
+                let Some(race) = encode.take() else {
+                    continue;
+                };
+                let error =
+                    encode_failure_verdict(&race.worker, &race.request_id, &failure, "dispatch");
+                // The prefill side is given up on: a call still pending is
+                // retired off the request path (its room is aborted when it
+                // lands), a stream it returned is dropped (its room is
+                // aborted now). The decode side is its partner either way:
+                // still dispatching, it is handed back; answered, its
+                // stream goes up with the verdict for its deferred abort.
+                match prefill_result.take() {
+                    Some(_answered) => {}
+                    None => retire_pd_side(
+                        PdSide::Prefill,
+                        race.connection,
+                        Arc::clone(&race.worker),
+                        prefill,
+                        Retirement::Silent,
+                    ),
+                }
+                return match decode_result.take() {
+                    Some(decode_answer) => PdDispatchOutcome::Both(Err(error), decode_answer),
+                    None => PdDispatchOutcome::FailedFirst {
+                        side: PdSide::Prefill,
+                        error,
+                        partner: decode,
+                    },
+                };
+            }
             DispatchStep::Witnessed(handed_off) => {
                 watching = false;
                 if let Some(worker) = handoff_to.filter(|_| handed_off) {
@@ -1469,6 +1622,9 @@ fn pd_side_error(
     error: &tonic::Status,
     workers: &WorkerSelection,
 ) -> Response {
+    if side == PdSide::Prefill && is_encode_dispatch_failure(error) {
+        return encode_dispatch_failure_response();
+    }
     if side == PdSide::Prefill && is_prefill_silence(error) {
         if let Some(prefill) = workers.prefill_worker() {
             return prefill_silence_response(error, prefill);
@@ -1639,9 +1795,24 @@ pub(crate) struct PrefillBound {
     /// twice (see [`liveness::decode_side_bound`]).
     partner_bound: Duration,
     backlog: Arc<OnceLock<Duration>>,
+    /// The watch on the request's encode dispatch, for the prefill side of
+    /// an EPD request: a failure reported on it ends the side's wait at
+    /// once (see [`launch_encode_dispatch`]). `None` for every other side.
+    encode: Option<EncodeWatch>,
 }
 
 impl PrefillBound {
+    /// This bound, watching `encode` beside the clock while the prefill
+    /// side's first response is awaited. The dispatch phase races the same
+    /// watch in [`dispatch_pd_sides`], bound or not; without a bound (the
+    /// rule off, a zero threshold) no first response is awaited, so a
+    /// failure after both dispatches returned is left to the request's
+    /// timeout there.
+    pub(crate) fn watching_encode(mut self, encode: Option<EncodeWatch>) -> Self {
+        self.encode = encode;
+        self
+    }
+
     /// The bound for a side of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     pub(crate) fn at(
@@ -1671,6 +1842,7 @@ impl PrefillBound {
             bound,
             partner_bound: bound,
             backlog: Arc::default(),
+            encode: None,
         })
     }
 }
@@ -1760,6 +1932,59 @@ fn prefill_side_silent(
 pub(crate) fn is_prefill_silence(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::DeadlineExceeded
         && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
+}
+
+/// The words a prefill side's verdict for a failed encode dispatch begins with.
+const ENCODE_DISPATCH_FAILED_MESSAGE: &str = "the request's encode dispatch failed";
+
+/// The verdict on a prefill side whose request's encode dispatch failed, in
+/// `phase` (the phases of [`prefill_side_silent`]): the embedding the side
+/// waits for at its rendezvous is not coming, so the side is given up on
+/// at once instead of at its silence bound. One WARN naming the worker,
+/// the request and the encode's failure; nothing is charged to the prefill
+/// worker, which never got to answer (see [`record_pd_dispatch_outcomes`]).
+/// The attempt fails here and is not replayed (see
+/// [`encode_dispatch_failure_response`]).
+fn encode_failure_verdict(
+    worker: &Arc<dyn Worker>,
+    request_id: &str,
+    failure: &str,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = worker.redacted_url(),
+        worker_type = metrics_labels::WORKER_PREFILL,
+        phase,
+        error = %failure,
+        "PD prefill side given up on: the request's encode dispatch failed, so its embedding is not coming"
+    );
+    tonic::Status::failed_precondition(format!(
+        "{ENCODE_DISPATCH_FAILED_MESSAGE} ({phase}): {failure}"
+    ))
+}
+
+/// Whether `status` is a prefill side's verdict for a failed encode dispatch.
+pub(crate) fn is_encode_dispatch_failure(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().starts_with(ENCODE_DISPATCH_FAILED_MESSAGE)
+}
+
+/// The client answer for a failed encode dispatch: a 502 under its own
+/// error code with one fixed message, final for the retry layer. The
+/// failure's own words name the encode worker's address as registered, so
+/// they stay in the log, where the dispatch was supervised and the verdict
+/// was logged; the client learns that the embedding is not coming and
+/// nothing about the worker. The plan's encode jobs are spent (their items
+/// and SHM went with them), so a replay on another prefill worker would
+/// wait for the same embedding; the client retries with the request.
+pub(crate) fn encode_dispatch_failure_response() -> Response {
+    let mut response = error::bad_gateway(
+        "encode_dispatch_failed",
+        "Encode dispatch failed: the request's encode dispatch was not taken, so its embedding is not coming; the request can be retried",
+    );
+    mark_non_retryable(&mut response);
+    response
 }
 
 /// The decode partner of a prefill side whose silence bound passed, when the
@@ -1866,6 +2091,9 @@ fn record_pd_dispatch_outcomes(
     decode_result: &StreamResult,
 ) {
     match prefill_result {
+        // The encode's failure, not the sides': the prefill worker never
+        // got to answer, and its partner is retired uncharged.
+        Err(e) if is_encode_dispatch_failure(e) => {}
         Err(e) if is_decode_silence(e) => record_silence_outcome(workers, ledger, e),
         _ => workers.record_prefill_decode_outcomes(
             ledger,
@@ -1886,6 +2114,9 @@ fn record_silence_outcome(
     ledger: &AttemptLedger,
     error: &tonic::Status,
 ) {
+    if is_encode_dispatch_failure(error) {
+        return;
+    }
     if let Some(status) = error.breaker_status() {
         if is_decode_silence(error) {
             workers.record_outcome_decode(ledger, status);
@@ -1971,7 +2202,10 @@ fn judge_prefill_side(
 /// request path (its room is aborted when it lands) and the silence verdict
 /// takes its place: the prefill's, or its decode `partner`'s when the
 /// partner had stalled mid-stream. Without a bound or a worker to charge,
-/// the call is awaited as it is.
+/// the call is awaited as it is. The request's encode dispatch, when one is
+/// watched, is raced beside both sides' dispatches by the caller
+/// ([`dispatch_pd_sides`]), bound or not; the bound's own watch serves the
+/// first-response phase ([`first_prefill_response_within`]).
 pub(crate) async fn dispatch_prefill_within(
     bound: Option<PrefillBound>,
     mut dispatch: SideDispatch,
@@ -2031,7 +2265,7 @@ pub(crate) async fn first_prefill_response_within(
     request_id: &str,
     prompt_tokens: u64,
 ) -> Result<FirstItem, tonic::Status> {
-    let (Some(bound), Some(worker)) = (bound, worker) else {
+    let (Some(mut bound), Some(worker)) = (bound, worker) else {
         return Ok(FirstItem::Response);
     };
     let partner_worker = partner.as_ref().map(|(partner, _)| *partner);
@@ -2042,6 +2276,11 @@ pub(crate) async fn first_prefill_response_within(
     loop {
         tokio::select! {
             biased;
+            failure = encode_dispatch_failed(bound.encode.as_mut()), if bound.encode.is_some() => {
+                // The embedding is not coming: the verdict names the
+                // encode; the caller drops the side, which aborts its room.
+                return Err(encode_failure_verdict(worker, request_id, &failure, "first_response"));
+            }
             handed_off = decode_handed_off(decode.as_deref_mut()), if decode.is_some() => {
                 if handed_off {
                     worker.note_prefill_handoff();
@@ -2082,6 +2321,9 @@ pub(crate) mod tests {
             WorkerType,
         },
     };
+
+    /// A boxed encode send, as the supervisor's tests build them.
+    type EncodeSend = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
     /// A decode side retired because its prefill fell silent is not charged
     /// for failing late: the handoff it waited for never came, and the
@@ -2603,7 +2845,7 @@ pub(crate) mod tests {
     async fn a_failed_prefill_answers_without_waiting_for_the_decode_side() {
         let started = tokio::time::Instant::now();
         let outcome =
-            dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers(), None).await;
+            dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers(), None, None).await;
 
         assert_eq!(
             started.elapsed(),
@@ -2627,6 +2869,7 @@ pub(crate) mod tests {
             answers_after(Duration::from_secs(120)),
             fails_now("decode refused"),
             None,
+            None,
         )
         .await;
 
@@ -2649,7 +2892,7 @@ pub(crate) mod tests {
         let ends: SideDispatch =
             Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
         let prefill_dispatch = answers_after(Duration::from_secs(1));
-        match dispatch_pd_sides(prefill_dispatch, ends, Some(&prefill)).await {
+        match dispatch_pd_sides(prefill_dispatch, ends, Some(&prefill), None).await {
             PdDispatchOutcome::Both(_, Ok(decode)) => assert!(decode.holds_item_ahead()),
             _ => panic!("both sides answered"),
         }
@@ -2675,6 +2918,326 @@ pub(crate) mod tests {
     /// A prefill side's bound of `bound` from `dispatched`.
     fn bound_from(dispatched: Instant, bound: Duration) -> PrefillBound {
         PrefillBound::of(bound, dispatched).expect("a bound within the clock's range")
+    }
+
+    /// The encode race of a dispatch test: the watch's receiver, the prefill
+    /// worker and the request.
+    fn encode_race(prefill: &Arc<dyn Worker>, watch: EncodeWatch) -> EncodeRace {
+        EncodeRace {
+            watch,
+            worker: Arc::clone(prefill),
+            connection: metrics_labels::CONNECTION_GRPC,
+            request_id: "chatcmpl-encode-failed".to_string(),
+        }
+    }
+
+    /// A three-second bound watching an encode dispatch, with the sender its
+    /// failure is published on.
+    fn bound_watching_encode() -> (PrefillBound, watch::Sender<Option<String>>) {
+        let (failed_tx, failed_rx) = watch::channel(None);
+        (
+            three_second_bound().watching_encode(Some(failed_rx)),
+            failed_tx,
+        )
+    }
+
+    /// The encode dispatch failing `after` a while: its failure published on
+    /// `failed_tx` (joined with the wait under test; nothing is spawned).
+    async fn encode_fails_after(after: Duration, failed_tx: watch::Sender<Option<String>>) {
+        tokio::time::sleep(after).await;
+        let _ = failed_tx.send(Some(
+            "connect to encode worker grpc://encode:30002 failed: connection refused".to_string(),
+        ));
+    }
+
+    /// The request's encode dispatch fails while both sides still dispatch,
+    /// no bound on either (the silence rule off): the prefill side is given
+    /// up on the moment the failure is known, the decode dispatch comes
+    /// back as its partner, and the attempt answers a 502 under its own
+    /// code that the retry layer does not replay (the plan's encode jobs
+    /// are spent), names no failed side and carries neither the encode
+    /// worker's address nor the failure's words.
+    #[tokio::test(start_paused = true)]
+    async fn a_pd_dispatch_whose_encode_dispatch_failed_is_given_up_on_at_once() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                never_answers(),
+                never_answers(),
+                None,
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+            "given up on at the encode's failure: {elapsed:?}"
+        );
+        let PdDispatchOutcome::FailedFirst {
+            side,
+            error,
+            partner,
+        } = outcome
+        else {
+            panic!("the prefill side's verdict, the decode dispatch as its partner");
+        };
+        assert_eq!(side, PdSide::Prefill);
+        drop(partner);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(is_encode_dispatch_failure(&error), "{error:?}");
+        assert!(!is_prefill_silence(&error));
+        assert!(error.message().contains("connection refused"), "{error:?}");
+
+        let response = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &error,
+            &workers,
+        );
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("encode_dispatch_failed")
+        );
+        assert!(
+            response.extensions().get::<FailedSide>().is_none(),
+            "the prefill worker is not the failed side"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "the plan's encode jobs are spent: no replay"
+        );
+        // The failure's words name the worker as registered: the log has
+        // them (the verdict's WARN), the client body does not.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("encode_dispatch_failed")
+                && !body.contains("encode:30002")
+                && !body.contains("connection refused"),
+            "the client learns the code, not the worker or the failure's words: {body}"
+        );
+    }
+
+    /// The prefill side answered its dispatch first (a servicer that returns
+    /// on submission) and the decode side still dispatches (one that holds
+    /// its headers until the KV arrives): the encode's failure still ends
+    /// the dispatch, the answered prefill stream dropped, the decode
+    /// dispatch handed back as the partner.
+    #[tokio::test(start_paused = true)]
+    async fn an_encode_dispatch_failure_after_the_prefill_answered_still_ends_the_dispatch() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let answered: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                answered,
+                never_answers(),
+                Some(&prefill),
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        match outcome {
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Prefill);
+                assert!(is_encode_dispatch_failure(&error), "{error:?}");
+            }
+            PdDispatchOutcome::Both(..) => panic!("the decode side had not answered"),
+        }
+    }
+
+    /// The decode side answered first and the prefill still dispatches: the
+    /// encode's failure ends the dispatch with both verdicts in, the
+    /// prefill's being the encode verdict and the decode's answer kept for
+    /// its deferred abort.
+    #[tokio::test(start_paused = true)]
+    async fn an_encode_dispatch_failure_after_the_decode_answered_ends_the_dispatch_with_both_in() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let answered: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                never_answers(),
+                answered,
+                None,
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        match outcome {
+            PdDispatchOutcome::Both(Err(error), Ok(_decode)) => {
+                assert!(is_encode_dispatch_failure(&error), "{error:?}");
+            }
+            _ => panic!("the prefill's encode verdict beside the decode's answer"),
+        }
+    }
+
+    /// One refused send is published while a sibling send is still in
+    /// flight: the supervisor reads the outcomes as they land, not after
+    /// the last one.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_failed_encode_send_is_published_while_a_sibling_is_still_pending() {
+        let (failed_tx, mut failed_rx) = watch::channel(None);
+        let outcomes: FuturesUnordered<EncodeSend> = FuturesUnordered::new();
+        outcomes.push(Box::pin(async {
+            Err(
+                "connect to encode worker grpc://encode:30002 failed: connection refused"
+                    .to_string(),
+            )
+        }));
+        outcomes.push(Box::pin(std::future::pending()));
+        let (first, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                encode_dispatch_failed(Some(&mut failed_rx))
+            ),
+            async {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    supervise_encode_sends(outcomes, failed_tx),
+                )
+                .await;
+            },
+        );
+        let first = first.expect("published before the pending sibling ends");
+        assert!(first.contains("connection refused"), "{first}");
+    }
+
+    /// An encode dispatch that was taken (the supervisor goes without a
+    /// failure) changes nothing: the side is judged by its bound as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_dispatch_behind_a_taken_encode_is_judged_by_its_bound_as_before() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        drop(failed_tx);
+        let started = tokio::time::Instant::now();
+        let result = dispatch_prefill_within(
+            Some(three_second_bound().watching_encode(Some(failed_rx))),
+            never_answers(),
+            Some(prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-taken".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "{elapsed:?}"
+        );
+        assert!(is_prefill_silence(&failure(result)));
+    }
+
+    /// The encode verdict is its own kind: neither a prefill nor a decode
+    /// silence, so no silence accounting applies to it, and its client
+    /// answer is a final 502 under its own code. Its breaker accounting is
+    /// `the_encode_verdict_charges_neither_sides_breaker`.
+    #[test]
+    fn the_encode_verdict_is_neither_a_silence_nor_a_sides_fault() {
+        let status = tonic::Status::failed_precondition(format!(
+            "{ENCODE_DISPATCH_FAILED_MESSAGE} (dispatch): encode worker refused"
+        ));
+        assert!(is_encode_dispatch_failure(&status));
+        assert!(!is_prefill_silence(&status));
+        assert!(!is_decode_silence(&status));
+        assert!(!is_encode_dispatch_failure(
+            &tonic::Status::failed_precondition("the engine's own precondition")
+        ));
+        let response = encode_dispatch_failure_response();
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&response));
+    }
+
+    /// The first-response phase races the watch too, ahead of the stream:
+    /// a failure already reported ends the wait at the first poll with the
+    /// `first_response` phase named, before the stream is read. (No engine
+    /// stream can be held open in a unit test without its transport, so the
+    /// stream here would end at once; the timing of the race is the
+    /// dispatch test's and the bed's.)
+    #[tokio::test]
+    async fn a_prefill_first_response_wait_ends_on_a_reported_encode_dispatch_failure() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (bound, failed_tx) = bound_watching_encode();
+        encode_fails_after(Duration::ZERO, failed_tx).await;
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
+        let status = first_prefill_response_within(
+            &mut stream,
+            Some(bound),
+            Some(&prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-late",
+            256,
+        )
+        .await
+        .expect_err("the encode verdict, not the stream's end");
+        assert!(is_encode_dispatch_failure(&status), "{status:?}");
+        assert!(status.message().contains("(first_response)"), "{status:?}");
+        assert!(!is_prefill_silence(&status) && !is_decode_silence(&status));
+    }
+
+    /// The encode verdict charges neither side's breaker: the prefill worker
+    /// never got to answer and its decode partner waited for a handoff that
+    /// could not come. Both keep executing on breakers one failure would
+    /// open.
+    #[test]
+    fn the_encode_verdict_charges_neither_sides_breaker() {
+        let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let ledger = AttemptLedger::default();
+        let status = tonic::Status::failed_precondition(format!(
+            "{ENCODE_DISPATCH_FAILED_MESSAGE} (dispatch): encode worker refused"
+        ));
+        let prefill_result: StreamResult = Err(status.clone());
+        let decode_result: StreamResult = Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new())));
+        record_pd_dispatch_outcomes(&workers, &ledger, &prefill_result, &decode_result);
+        record_silence_outcome(&workers, &ledger, &status);
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the prefill worker never got to answer"
+        );
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "the decode partner waited for a handoff that could not come"
+        );
     }
 
     /// A prefill call that has returned no stream by its bound is given up on
