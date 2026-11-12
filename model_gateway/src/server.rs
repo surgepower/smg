@@ -67,7 +67,9 @@ pub use tls::{blocking_http_client, http_client, http_client_builder, install_cr
 use crate::{
     app_context::AppContext,
     config::{redacted, ParserChoice, RouterConfig},
-    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
+    endpoints::{
+        conversations, models, parse, responses as response_handlers, tokenize, RoutePath,
+    },
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
         MeshAdapters,
@@ -639,7 +641,7 @@ async fn v1_conversations_create(
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    RoutePath(conversation_id): RoutePath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation(
@@ -653,7 +655,7 @@ async fn v1_conversations_get(
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    RoutePath(conversation_id): RoutePath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -669,7 +671,7 @@ async fn v1_conversations_update(
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    RoutePath(conversation_id): RoutePath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation(
@@ -690,7 +692,7 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    RoutePath(conversation_id): RoutePath<String>,
     Query(ListItemsQuery {
         limit,
         order,
@@ -713,7 +715,7 @@ async fn v1_conversations_list_items(
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    RoutePath(conversation_id): RoutePath<String>,
     Json(body): Json<Value>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
@@ -730,7 +732,7 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    RoutePath((conversation_id, item_id)): RoutePath<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
     // `include` arrives as repeated `include[]=` / `include=` pairs; each value
@@ -754,7 +756,7 @@ async fn v1_conversations_get_item(
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    RoutePath((conversation_id, item_id)): RoutePath<(String, String)>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(

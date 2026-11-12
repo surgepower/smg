@@ -10,4 +10,7 @@ pub mod conversations;
 pub mod models;
 pub mod parse;
 pub mod responses;
+mod route_path;
 pub mod tokenize;
+
+pub use route_path::RoutePath;

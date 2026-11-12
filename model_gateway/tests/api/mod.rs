@@ -9,4 +9,5 @@ mod parser_endpoints_test;
 mod request_formats_test;
 #[cfg(feature = "provider-openai")]
 mod responses_api_test;
+mod route_path_test;
 mod streaming_tests;
