@@ -414,7 +414,9 @@ pub(super) enum Node {
     /// `(?!XY)` or `(?!X?Y)` over two classes, at most two characters read
     /// ahead: fails when the next character is in `first` and the one after
     /// in `second`, or, with the first optional, when the next is in
-    /// `second`.
+    /// `second`. It stands only as a [`Node::UnitRun`]'s own lookahead
+    /// ([`unit_run_misplaced`]): after a class run it would read past the
+    /// end of a unit of the thread pool where the whole text reads on.
     NotAheadSeq {
         first: usize,
         first_optional: bool,
@@ -1713,9 +1715,14 @@ enum Follow<'a> {
 /// give a unit back to what follows, which the run never does: anything
 /// but the end of its alternative or the negative lookahead over the run's
 /// own unit (`(?!X?Y)`, `(?!XY)` or `(?!Y)` with the run's classes), which
-/// holds after a maximal run by construction. Such a pattern declines.
+/// holds after a maximal run by construction; or whether a
+/// [`Node::NotAheadSeq`] sits anywhere but as such a run's lookahead (after
+/// a class run it would read past the end of a unit of the thread pool,
+/// where the whole text reads on, and cut the two apart). Such a pattern
+/// declines.
 fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> bool {
     match node {
+        Node::NotAheadSeq { .. } => true,
         Node::UnitRun { first, second, .. } => match follow {
             Follow::Nothing => false,
             Follow::Lookahead(Node::NotAhead(class)) => {
@@ -1732,6 +1739,13 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
             Follow::Lookahead(_) | Follow::Other => true,
         },
         Node::Concat(nodes) => nodes.iter().enumerate().any(|(i, node)| {
+            // The run before a sequence lookahead answers for it.
+            if matches!(node, Node::NotAheadSeq { .. })
+                && i > 0
+                && matches!(nodes[i - 1], Node::UnitRun { .. })
+            {
+                return false;
+            }
             let rest = &nodes[i + 1..];
             let next = match (rest, follow) {
                 ([], follow) => follow,
@@ -1746,11 +1760,7 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
             .iter()
             .any(|alternative| unit_run_misplaced(alternative, classes, follow)),
         Node::Repeat { node, .. } => unit_run_misplaced(node, classes, Follow::Other),
-        Node::Class(_)
-        | Node::ClassRepeat { .. }
-        | Node::NotAhead(_)
-        | Node::NotAheadSeq { .. }
-        | Node::End => false,
+        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
     }
 }
 
@@ -2754,6 +2764,15 @@ mod tests {
             r"\s+$|^a",
             r"a$?",
             r"(?:a|$)",
+            // a sequence lookahead anywhere but as a unit run's own: after a
+            // class run it reads past a pool unit's end where the whole text
+            // reads on
+            r"[a]+(?![ ][b])| [a-z]+",
+            r"[a-z]+(?!\r?\n)",
+            r"[a-z]+(?![b][c])",
+            r"(?!\r?\n)[a-z]",
+            r"a(?!\r?\n)b",
+            r"(?:[ab]?[c])+x(?![ab]?[c])",
             // a sequence lookahead outside the two-character shape
             r"a(?!b?)",
             r"a(?!\r?\n?)",
@@ -2913,11 +2932,16 @@ mod tests {
             (LINE_BREAK_RUNS, "\r\r\n"),
             (LINE_BREAK_RUNS, "no break"),
             (LINE_BREAK_RUNS, ""),
-            (r"[a-z]+(?!\r?\n)", "ab\ncd\r\nef\rgh"),
-            (r"[a-z]+(?![b][c])", "abc abd ab a"),
+            (r"(?:[ab]?[bc]){3,}", "abc bbb abcbc ab b"),
+            (r"(?:\r?\n){2,}(?!\r?\n)", "a\nb\n\nc\r\n\r\n\rd\r\n\ne"),
             (r"(?:[ab]?[c])+(?![ab]?[c])", "cacbcc acbc x"),
             (r"(?:[ab]?[c])+(?![c])", "cacbcc acbc x"),
             (r"(?:[ab]?[c])+", "cacbcc acbc x"),
+            (r"(?:\r?\n){2,}", "a\nb\n\nc\r\n\r\nd\r\n\ne\n\n\n"),
+            (r"(?:\r?\n){2,}(?!\r?\n)", "a\nb\n\nc\r\n\r\nd\r\n\ne\n\n\n"),
+            (r"(?:\r?\n){3,}", "\n\n\r\n\n\r\n\r\n"),
+            (r"(?:\r?\n)+(?!\n)", "a\nb\r\n\nc\r"),
+            (r"(?:[ab]?[c]){2,}(?![c])", "cacbcc acbc x c cc"),
         ] {
             assert_eq!(
                 cuts_of(pattern, text),
@@ -2935,6 +2959,11 @@ mod tests {
             .program
             .iter()
             .any(|op| matches!(op, Op::UnitRun { min: 1, .. })));
+        let two = Pattern::parse(r"(?:\r?\n){2,}").expect("parses");
+        assert!(two
+            .program
+            .iter()
+            .any(|op| matches!(op, Op::UnitRun { min: 2, .. })));
         assert!(parsed.program.iter().any(|op| matches!(
             op,
             Op::NotAheadSeq {
