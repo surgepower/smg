@@ -980,6 +980,43 @@ fn a_stage_after_the_byte_level_reads_the_image() {
             );
         }
     }
+    // The two configurations whose decline rows went with this change, on
+    // the direct path now: a regex `Split` after the `ByteLevel` that reads
+    // beyond ASCII through the engine's `\p{N}`, and one with the end
+    // anchor, where `end_anchored` and `mapped_from` both hold (over the
+    // image `$` holds only at an image piece's end: a `\n` is `Ċ` there).
+    let base = &shapes()[0];
+    for (pattern, anchored) in [(r"\p{N}", false), (r"[a-z]+$", true)] {
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            byte_level(false),
+            split(pattern, SplitDelimiterBehavior::Isolated, false),
+        ]))));
+        let native = seeded(&tokenizer);
+        assert_eq!(native.mapped_from, Some(0), "{pattern}");
+        assert_eq!(native.end_anchored, anchored, "{pattern}");
+        for text in [
+            "abc\ndef",
+            "x\u{B2}\n",
+            "abc",
+            "ab1c2 d\u{BD}e",
+            "x\u{BC}y\n\n",
+            "\u{4E32}\n\u{4E39}",
+            "12 ab\nAB cd",
+            "tab\there\n",
+            "\n",
+            "",
+        ] {
+            let reference = tokenizer.encode(text, false).expect("encode");
+            for parallel in [false, true] {
+                assert_eq!(
+                    native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                    Ok(reference.get_ids().to_vec()),
+                    "{pattern}: {text:?} parallel {parallel}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
