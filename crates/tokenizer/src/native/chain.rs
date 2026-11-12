@@ -499,6 +499,7 @@ mod tests {
         Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
             keep_gaps,
+            digits: false,
         }
     }
 
