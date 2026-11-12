@@ -2007,6 +2007,19 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_read_only_tool_is_replayable() {
+        // The server's own hint, as tools/list carries it, reaches the entry
+        // the orchestrator reads: no hand-set annotation is needed.
+        let mut tool = create_test_tool("lookup");
+        tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+        let entry = ToolEntry::from_server_tool("srv", tool);
+        assert!(McpOrchestrator::replayable(&entry));
+
+        let unhinted = ToolEntry::from_server_tool("srv", create_test_tool("order"));
+        assert!(!McpOrchestrator::replayable(&unhinted));
+    }
+
+    #[test]
     fn a_non_replayable_call_is_unknown_whether_or_not_recovery_succeeds() {
         let failed = || Err(McpError::ConnectionFailed("handshake".to_string()));
 

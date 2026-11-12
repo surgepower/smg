@@ -1076,4 +1076,44 @@ mod tests {
         inventory.clear_server_tools("s");
         assert_eq!(inventory.counts(), (0, 0, 0));
     }
+
+    #[test]
+    fn a_listed_tool_s_annotations_reach_its_entry() {
+        // tools/list carried the server's hints: the entry every reader of the
+        // inventory consults holds them, and a hint the server left out keeps
+        // its conservative default.
+        let mut tool = create_test_tool("lookup");
+        tool.annotations = Some(
+            rmcp::model::ToolAnnotations::new()
+                .read_only(true)
+                .idempotent(true)
+                .destructive(false)
+                .open_world(false),
+        );
+        let entry = ToolEntry::from_server_tool("srv", tool);
+        assert_eq!(
+            entry.annotations,
+            crate::annotations::ToolAnnotations {
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            }
+        );
+
+        let mut partial = create_test_tool("partial");
+        partial.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+        let partial = ToolEntry::from_server_tool("srv", partial);
+        assert!(partial.annotations.read_only);
+        assert!(
+            partial.annotations.destructive,
+            "an absent hint keeps its default"
+        );
+
+        let unhinted = ToolEntry::from_server_tool("srv", create_test_tool("plain"));
+        assert_eq!(
+            unhinted.annotations,
+            crate::annotations::ToolAnnotations::default()
+        );
+    }
 }

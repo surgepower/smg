@@ -145,12 +145,17 @@ pub struct ToolEntry {
 }
 
 impl ToolEntry {
+    /// An entry for `tool` under `qualified_name`. The hints the server listed
+    /// with the tool (read-only, destructive, idempotent, open-world) become the
+    /// entry's annotations; a hint the server left out keeps its conservative
+    /// default, so a tool listed without annotations is treated as before.
     pub fn new(qualified_name: QualifiedToolName, tool: Tool) -> Self {
+        let annotations = ToolAnnotations::from_rmcp_option(tool.annotations.as_ref());
         Self {
             qualified_name,
             tool,
             category: ToolCategory::default(),
-            annotations: ToolAnnotations::default(),
+            annotations,
             tenant_id: None,
             alias_target: None,
             arg_mapping: None,
