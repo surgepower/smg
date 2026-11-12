@@ -1774,7 +1774,11 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
             .iter()
             .any(|alternative| unit_run_misplaced(alternative, classes, follow)),
         Node::Repeat { node, .. } => unit_run_misplaced(node, classes, Follow::Other),
-        Node::Class(_) | Node::ClassRepeat { .. } | Node::NotAhead(_) | Node::End => false,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::End
+        | Node::GroupsAhead { .. } => false,
     }
 }
 
